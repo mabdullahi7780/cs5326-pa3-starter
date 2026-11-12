@@ -24,6 +24,22 @@ def parse_steps(completion_text: str) -> list[str]:
     return cleaned
 
 
+# 'final answer' in any case, with any spacing between the two words.
+_DELIMITER_RE = re.compile(r"final\s*answer", re.IGNORECASE)
+
+# Characters allowed between the delimiter and the number: the colon,
+# whitespace (including a line break), markdown marks and a currency sign.
+_SKIP_RE = re.compile(r"^[\s:*_`#$]*")
+
+# Optional minus sign, optional currency sign, then digits (plain or grouped
+# by thousands commas) and an optional decimal part.
+_NUMBER_RE = re.compile(r"(-)?\s*\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
+
+# A number directly followed by more digits, a comma and a digit, or a slash
+# and a digit is a malformed grouping or a fraction, not an integer answer.
+_MALFORMED_TAIL_RE = re.compile(r",?\d|\s*/\s*\d")
+
+
 def extract_answer(completion_text: str) -> int | None:
     """
     Extracts the final numeric integer from the completion.
@@ -41,5 +57,28 @@ def extract_answer(completion_text: str) -> int | None:
       - No 'Final Answer' present -> None
       - Empty string or None-like garbage -> None, and never raise
     """
-    # TODO: Implement robust regex answer extraction
-    raise NotImplementedError("Implement extract_answer in src/extraction.py")
+    if not isinstance(completion_text, str) or not completion_text:
+        return None
+    try:
+        # Use the last delimiter; earlier ones are scratch attempts.
+        delimiters = list(_DELIMITER_RE.finditer(completion_text))
+        if not delimiters:
+            return None
+        rest = completion_text[delimiters[-1].end():]
+        rest = _SKIP_RE.sub("", rest, count=1)
+
+        # The answer must come first; there is no fallback to other integers.
+        match = _NUMBER_RE.match(rest)
+        if match is None:
+            return None
+        if _MALFORMED_TAIL_RE.match(rest[match.end():]):
+            return None
+
+        sign, digits, fraction = match.group(1), match.group(2), match.group(3)
+        # Integer-valued decimals ('18.00') pass; others ('18.5') fail.
+        if fraction is not None and fraction.strip("0"):
+            return None
+        value = int(digits.replace(",", ""))
+        return -value if sign else value
+    except Exception:
+        return None
