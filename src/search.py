@@ -6,6 +6,10 @@ from typing import Any, Callable
 GenerateFn = Callable[[str, int, dict], list[dict]]
 JudgeFn = Callable[[str], dict]
 
+# 'product_logprob' is the optional bonus (manual 2.4, item 4): its step scores are
+# the judge's verdict probabilities p_t in [0, 1], not +1/-1 verdicts.
+AGGREGATION_STRATEGIES = ("min", "product", "step_penalty", "product_logprob")
+
 
 def aggregate_path_score(
     step_scores: list[float], 
@@ -22,8 +26,34 @@ def aggregate_path_score(
       - 'step_penalty': mean(step_scores) - penalty_lambda * count(r_t == -1.0).
       - An unknown strategy raises ValueError.
     """
-    # TODO: Implement min, product, and step_penalty aggregation
-    raise NotImplementedError("Implement aggregate_path_score in src/search.py")
+    # Checked first, so a misspelt strategy is caught even for an empty path.
+    if strategy not in AGGREGATION_STRATEGIES:
+        raise ValueError(f"Unknown aggregation strategy: {strategy!r}")
+
+    scores = [float(score) for score in (step_scores or [])]
+    if not scores:
+        return -1.0
+
+    if strategy == "min":
+        return min(scores)
+
+    if strategy == "product":
+        product = 1.0
+        for r in scores:
+            product *= min(max((r + 1.0) / 2.0, 0.01), 0.99)
+        return product
+
+    if strategy == "step_penalty":
+        num_invalid = sum(1 for r in scores if r == -1.0)
+        return sum(scores) / len(scores) - float(penalty_lambda) * num_invalid
+
+    # product_logprob: the joint validity of the path, from continuous probabilities.
+    product = 1.0
+    for p in scores:
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f"product_logprob expects probabilities in [0, 1], got {p}")
+        product *= p
+    return product
 
 
 def select_best_path(

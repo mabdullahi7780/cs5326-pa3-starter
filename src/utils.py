@@ -232,6 +232,90 @@ def make_hf_judge_fn(judge_model: Any, judge_tokenizer: Any) -> Callable[[str], 
     return judge_fn
 
 
+def judge_prompts_batched(
+    judge_model: Any, judge_tokenizer: Any, prompts: list[str], batch_size: int = 16
+) -> list[dict]:
+    """
+    Runs many judge prompts through batched greedy generate() calls.
+
+    Uses the same chat template, JUDGE_GEN_KWARGS, EOS slicing and token counting
+    as make_hf_judge_fn, with left padding so every row's new tokens start at the
+    same column. Returns one {"text", "num_tokens"} per prompt, in input order.
+    Every prompt is generated, duplicates included, so the token counts are real.
+    """
+    try:
+        import torch
+        no_grad_ctx = torch.no_grad
+    except ImportError:
+        class _NoGrad:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        no_grad_ctx = lambda: _NoGrad()
+
+    prompts = list(prompts or [])
+    if not prompts:
+        return []
+    batch_size = max(1, int(batch_size))
+    eos_ids = _get_eos_token_ids(judge_model, judge_tokenizer)
+    kwargs = dict(JUDGE_GEN_KWARGS)
+    kwargs.setdefault("pad_token_id", judge_tokenizer.eos_token_id)
+
+    previous_side = getattr(judge_tokenizer, "padding_side", None)
+    judge_tokenizer.padding_side = "left"
+    results: list[dict] = []
+    try:
+        for start in range(0, len(prompts), batch_size):
+            chunk = prompts[start:start + batch_size]
+            formatted = [
+                judge_tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
+                )
+                for prompt in chunk
+            ]
+            inputs = judge_tokenizer(formatted, return_tensors="pt", padding=True)
+            inputs = {k: v.to(judge_model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+            prompt_len = inputs["input_ids"].shape[1]
+
+            with no_grad_ctx():
+                output_ids = judge_model.generate(**inputs, **kwargs)
+
+            for i in range(output_ids.shape[0]):
+                gen_tokens_valid = _slice_to_first_eos(output_ids[i][prompt_len:], eos_ids)
+                text = judge_tokenizer.decode(gen_tokens_valid, skip_special_tokens=True)
+                results.append({"text": text, "num_tokens": len(gen_tokens_valid)})
+    finally:
+        if previous_side is not None:
+            judge_tokenizer.padding_side = previous_side
+    return results
+
+
+def make_replay_judge_fn(prompts: list[str], outputs: list[dict]) -> Callable[[str], dict]:
+    """
+    A JudgeFn that hands back precomputed judge outputs in order.
+
+    score_path calls it exactly as it would call the real judge. Each call must
+    bring the next expected prompt, so outputs from a batched pre-pass can never
+    be matched to the wrong step.
+    """
+    prompts = list(prompts)
+    outputs = list(outputs)
+    if len(prompts) != len(outputs):
+        raise ValueError(f"{len(prompts)} prompts but {len(outputs)} outputs")
+    position = [0]
+
+    def judge_fn(judge_prompt: str) -> dict:
+        index = position[0]
+        if index >= len(prompts):
+            raise IndexError("more judge calls than precomputed outputs")
+        if judge_prompt != prompts[index]:
+            raise ValueError(f"judge call {index} does not match the precomputed prompt")
+        position[0] += 1
+        return dict(outputs[index])
+
+    judge_fn.remaining = lambda: len(prompts) - position[0]  # type: ignore[attr-defined]
+    return judge_fn
+
+
 def save_results_summary(results_list: list[dict[str, Any]], filepath: str = "outputs/results_summary.json") -> None:
     """
     Saves results_summary.json conforming strictly to the assignment schema:
