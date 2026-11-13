@@ -29,11 +29,13 @@ _DELIMITER_RE = re.compile(r"final\s*answer", re.IGNORECASE)
 
 # Characters allowed between the delimiter and the number: the colon,
 # whitespace (including a line break), markdown marks and a currency sign.
-_SKIP_RE = re.compile(r"^[\s:*_`#$]*")
+# The currency sign may be LaTeX-escaped ('\$26'); a backslash is skipped only
+# directly before '$', so '\boxed{18}' and '\(18\)' still return None.
+_SKIP_RE = re.compile(r"^(?:[\s:*_`#$]|\\\$)*")
 
-# Optional minus sign, optional currency sign, then digits (plain or grouped
-# by thousands commas) and an optional decimal part.
-_NUMBER_RE = re.compile(r"(-)?\s*\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
+# Optional minus sign, optional (possibly escaped) currency sign, then digits
+# (plain or grouped by thousands commas) and an optional decimal part.
+_NUMBER_RE = re.compile(r"(-)?\s*(?:\\?\$)?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?")
 
 # A number directly followed by more digits, a comma and a digit, or a slash
 # and a digit is a malformed grouping or a fraction, not an integer answer.
