@@ -27,13 +27,9 @@ _PROMPT_FORMAT = (
     "Rules:\n"
     '- Start every step on a new line with "Step k:", numbering from 1.\n'
     "- Each step makes one deduction or one calculation.\n"
-    "- Write all math as plain text, for example 3 * 4 = 12. "
-    "Do not use LaTeX: no \\( \\), no \\[ \\], no \\frac, no \\times, no \\$.\n"
-    "- Do not use markdown (no headings, bold or bullet points) and do not use \\boxed{}.\n"
-    '- Always finish with the line "Final Answer: <integer>", '
-    "even when the last step already states the result.\n"
-    "- In the Final Answer line, write the integer in digits only: "
-    "no words, units, dollar sign or decimal point.\n"
+    "- Use plain text only: no markdown headings, no bold, no LaTeX, no \\boxed{}.\n"
+    '- The last line must be "Final Answer: " followed by the integer only, '
+    "with no units, dollar sign or brackets.\n"
     "- Write nothing after the Final Answer line."
 )
 
