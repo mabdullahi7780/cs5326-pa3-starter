@@ -1,7 +1,11 @@
 """
 src/search.py - Path aggregation, Best-of-N search, and compute-matched search.
 """
+import time
 from typing import Any, Callable
+
+from .generation import compute_majority_vote, run_self_consistency
+from .prm_judge import score_path
 
 GenerateFn = Callable[[str, int, dict], list[dict]]
 JudgeFn = Callable[[str], dict]
@@ -9,6 +13,10 @@ JudgeFn = Callable[[str], dict]
 # 'product_logprob' is the optional bonus (manual 2.4, item 4): its step scores are
 # the judge's verdict probabilities p_t in [0, 1], not +1/-1 verdicts.
 AGGREGATION_STRATEGIES = ("min", "product", "step_penalty", "product_logprob")
+
+# Path scores within this distance of the best one count as tied (manual 5.3, rule 3).
+# Float products depend on the order of the steps, so exact equality is not safe.
+TIE_TOLERANCE = 1e-9
 
 
 def aggregate_path_score(
@@ -83,8 +91,40 @@ def select_best_path(
          'path_score' (float) and 'num_tied' (int, size of the tied set).
          Does not mutate the inputs.
     """
-    # TODO: Implement best path selection with answer=None filtering and majority tie-breaking
-    raise NotImplementedError("Implement select_best_path in src/search.py")
+    candidates = list(candidate_paths or [])
+    if not candidates:
+        raise ValueError("select_best_path needs at least one candidate")
+
+    # Rule 1: one path score per candidate. A missing or empty step list scores -1.0.
+    scores = [
+        aggregate_path_score(candidate.get("step_scores") or [], aggregation_strategy, penalty_lambda)
+        for candidate in candidates
+    ]
+    answers = [candidate.get("answer") for candidate in candidates]
+
+    # Rule 2: drop answer=None candidates, unless every answer is None.
+    if any(answer is not None for answer in answers):
+        eligible = [i for i, answer in enumerate(answers) if answer is not None]
+    else:
+        eligible = list(range(len(candidates)))
+
+    # Rule 3: the tied set is every eligible candidate within the tolerance of the best score.
+    best = max(scores[i] for i in eligible)
+    tied = [i for i in eligible if scores[i] >= best - TIE_TOLERANCE]
+
+    # Rule 4: vote among the tied answers and take the lowest index with the voted answer.
+    # After rule 2 the vote is None only when every tied answer is None.
+    chosen = tied[0]
+    if len(tied) > 1:
+        vote = compute_majority_vote([answers[i] for i in tied])
+        if vote is not None:
+            chosen = next(i for i in tied if answers[i] == vote)
+
+    # Rule 5: a shallow copy, so the input dicts are never changed.
+    selected = dict(candidates[chosen])
+    selected["path_score"] = float(scores[chosen])
+    selected["num_tied"] = len(tied)
+    return selected
 
 
 def run_prm_best_of_n(
@@ -115,8 +155,46 @@ def run_prm_best_of_n(
       selected, answer, candidates [each augmented with step_scores, rationales],
       generation_calls, judge_calls, generated_tokens, judge_tokens, time_seconds
     """
-    # TODO: Implement PRM Best-of-N search over candidate trajectories
-    raise NotImplementedError("Implement run_prm_best_of_n in src/search.py")
+    start = time.perf_counter()
+
+    if candidates is None:
+        # No shared pool: sample n paths, and their cost belongs to this call.
+        sampled = run_self_consistency(model, gen_tokenizer, question, n=n, generate_fn=generate_fn)
+        pool = sampled["candidates"]
+        generation_calls = sampled["generation_calls"]
+        generated_tokens = sampled["generated_tokens"]
+    else:
+        # Shared pool: judge every candidate passed in and sample nothing.
+        pool = list(candidates)
+        generation_calls = 0
+        generated_tokens = 0
+
+    judged = []
+    judge_calls = 0
+    judge_tokens = 0
+    for candidate in pool:
+        result = score_path(judge_model, judge_tokenizer, question, candidate, judge_fn)
+        # A new dict per candidate, so the shared pool is never changed.
+        judged.append({
+            **candidate,
+            "step_scores": result["step_scores"],
+            "rationales": result["rationales"],
+        })
+        judge_calls += result["judge_calls"]
+        judge_tokens += result["judge_tokens"]
+
+    selected = select_best_path(judged, aggregation_strategy, penalty_lambda) if judged else None
+
+    return {
+        "selected": selected,
+        "answer": selected.get("answer") if selected is not None else None,
+        "candidates": judged,
+        "generation_calls": generation_calls,
+        "judge_calls": judge_calls,
+        "generated_tokens": generated_tokens,
+        "judge_tokens": judge_tokens,
+        "time_seconds": time.perf_counter() - start,
+    }
 
 
 def run_compute_matched_self_consistency(
@@ -137,5 +215,33 @@ def run_compute_matched_self_consistency(
       candidates, answer, generation_calls (new samples only), total_samples,
       generated_tokens (new samples only), time_seconds
     """
-    # TODO: Implement compute-matched Self-Consistency with sample reuse
-    raise NotImplementedError("Implement run_compute_matched_self_consistency in src/search.py")
+    start = time.perf_counter()
+    existing = list(existing_candidates or [])
+
+    # Sample only the deficit. A pool that already meets the target is returned whole.
+    deficit = max(0, target_calls - len(existing))
+    if deficit > 0:
+        sampled = run_self_consistency(
+            model, tokenizer, question, n=deficit, temperature=temperature, generate_fn=generate_fn
+        )
+        new_candidates = sampled["candidates"]
+        generation_calls = sampled["generation_calls"]
+        generated_tokens = sampled["generated_tokens"]
+    else:
+        new_candidates = []
+        generation_calls = 0
+        generated_tokens = 0
+
+    # Existing first, then new, in sampling order. The vote breaks ties by earliest index,
+    # so this order keeps N = target_calls on the scaling curve equal to this answer.
+    all_candidates = existing + new_candidates
+    answer = compute_majority_vote([candidate.get("answer") for candidate in all_candidates])
+
+    return {
+        "candidates": all_candidates,
+        "answer": answer,
+        "generation_calls": generation_calls,
+        "total_samples": len(all_candidates),
+        "generated_tokens": generated_tokens,
+        "time_seconds": time.perf_counter() - start,
+    }
