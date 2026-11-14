@@ -2,6 +2,7 @@
 src/utils.py - Model loading, generation constants, seed management, and factories.
 """
 import json
+import math
 import os
 from typing import Any, Callable
 
@@ -232,8 +233,54 @@ def make_hf_judge_fn(judge_model: Any, judge_tokenizer: Any) -> Callable[[str], 
     return judge_fn
 
 
+def verdict_token_pairs(tokenizer: Any) -> tuple[tuple[int, int], ...]:
+    """
+    Token ids of the two verdict words, as (valid_id, invalid_id) pairs, for the
+    optional product_logprob bonus (manual 2.4, item 4).
+
+    The first pair is the form after 'Verdict:' (' VALID', ' INVALID'); the second
+    is the form with no leading space (as after '**'). Each word must be a single
+    token, so the first-token logits are the full-sequence comparison.
+    """
+    pairs = []
+    for valid_text, invalid_text in ((" VALID", " INVALID"), ("VALID", "INVALID")):
+        valid_ids = tokenizer.encode(valid_text, add_special_tokens=False)
+        invalid_ids = tokenizer.encode(invalid_text, add_special_tokens=False)
+        if len(valid_ids) != 1 or len(invalid_ids) != 1:
+            raise ValueError(f"verdict words are not single tokens: {valid_ids} {invalid_ids}")
+        pairs.append((int(valid_ids[0]), int(invalid_ids[0])))
+    return tuple(pairs)
+
+
+def _two_way_softmax(z_valid: float, z_invalid: float) -> float:
+    """exp(z_valid) / (exp(z_valid) + exp(z_invalid)), written so it cannot overflow."""
+    diff = z_invalid - z_valid
+    if diff >= 0:
+        e = math.exp(-diff)
+        return e / (1.0 + e)
+    return 1.0 / (1.0 + math.exp(diff))
+
+
+def _verdict_probability(gen_ids: Any, step_logits: Any, row: int, pairs: tuple) -> float | None:
+    """
+    P(VALID) at the first generated verdict token, from the raw logits of that step.
+
+    step_logits[t] holds the logits used to choose generated token t. Returns None
+    when no verdict token was generated.
+    """
+    ids = gen_ids.tolist() if hasattr(gen_ids, "tolist") else list(gen_ids)
+    for t, token in enumerate(ids):
+        for valid_id, invalid_id in pairs:
+            if token == valid_id or token == invalid_id:
+                z_valid = float(step_logits[t][row][valid_id])
+                z_invalid = float(step_logits[t][row][invalid_id])
+                return _two_way_softmax(z_valid, z_invalid)
+    return None
+
+
 def judge_prompts_batched(
-    judge_model: Any, judge_tokenizer: Any, prompts: list[str], batch_size: int = 16
+    judge_model: Any, judge_tokenizer: Any, prompts: list[str], batch_size: int = 16,
+    return_verdict_probs: bool = False
 ) -> list[dict]:
     """
     Runs many judge prompts through batched greedy generate() calls.
@@ -242,6 +289,11 @@ def judge_prompts_batched(
     as make_hf_judge_fn, with left padding so every row's new tokens start at the
     same column. Returns one {"text", "num_tokens"} per prompt, in input order.
     Every prompt is generated, duplicates included, so the token counts are real.
+
+    With return_verdict_probs=True (the optional bonus), generate() also returns the
+    raw logits (output_logits, before the repetition penalty and other processors),
+    and each result gets "verdict_prob": P(VALID) at the first generated verdict
+    token, or None if there is none. The generated tokens are the same either way.
     """
     try:
         import torch
@@ -259,6 +311,11 @@ def judge_prompts_batched(
     eos_ids = _get_eos_token_ids(judge_model, judge_tokenizer)
     kwargs = dict(JUDGE_GEN_KWARGS)
     kwargs.setdefault("pad_token_id", judge_tokenizer.eos_token_id)
+    pairs = ()
+    if return_verdict_probs:
+        pairs = verdict_token_pairs(judge_tokenizer)
+        kwargs["output_logits"] = True
+        kwargs["return_dict_in_generate"] = True
 
     previous_side = getattr(judge_tokenizer, "padding_side", None)
     judge_tokenizer.padding_side = "left"
@@ -277,12 +334,17 @@ def judge_prompts_batched(
             prompt_len = inputs["input_ids"].shape[1]
 
             with no_grad_ctx():
-                output_ids = judge_model.generate(**inputs, **kwargs)
+                generated = judge_model.generate(**inputs, **kwargs)
+            output_ids = generated.sequences if return_verdict_probs else generated
 
             for i in range(output_ids.shape[0]):
                 gen_tokens_valid = _slice_to_first_eos(output_ids[i][prompt_len:], eos_ids)
                 text = judge_tokenizer.decode(gen_tokens_valid, skip_special_tokens=True)
-                results.append({"text": text, "num_tokens": len(gen_tokens_valid)})
+                record = {"text": text, "num_tokens": len(gen_tokens_valid)}
+                if return_verdict_probs:
+                    record["verdict_prob"] = _verdict_probability(gen_tokens_valid, generated.logits, i, pairs)
+                results.append(record)
+            del generated  # the raw logits are large; free them before the next batch
     finally:
         if previous_side is not None:
             judge_tokenizer.padding_side = previous_side
